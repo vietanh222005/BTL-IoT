@@ -1,0 +1,134 @@
+#include <Wire.h>
+#include "MAX30100_PulseOximeter.h"
+#include <WiFi.h>
+#include <PubSubClient.h>
+
+// ================== Cấu hình I2C ==================
+#define SDA_PIN 21
+#define SCL_PIN 22
+
+// ================== WiFi ==================
+const char* ssid     = "Mo";              // 👉 WiFi của bạn
+const char* password = "12345678910";    // 👉 Mật khẩu WiFi
+
+// ================== ThingsBoard ==================
+const char* tbServer = "thingsboard.cloud";
+const int   tbPort   = 1883;
+const char* tbToken  = "qlbr1pyum8u7bwdssrdr";   // 👉 Access Token
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+// ================== MAX30100 ==================
+PulseOximeter pox;
+uint32_t tsLastReport = 0;
+
+// ================== Nút BOOT ==================
+#define BOOT_PIN 0     // GPIO0 = nút BOOT
+bool tbEnabled = true; // cờ cho phép kết nối ThingsBoard
+
+// Callback khi phát hiện nhịp tim
+void onBeatDetected() {
+  Serial.println("❤️ Nhịp tim được phát hiện!");
+}
+
+// ================== Kết nối WiFi ==================
+void setup_wifi() {
+  Serial.print("🔌 Kết nối WiFi: ");
+  Serial.println(ssid);
+
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\n✅ WiFi đã kết nối!");
+  Serial.print("IP ESP32: ");
+  Serial.println(WiFi.localIP());
+}
+
+// ================== Kết nối ThingsBoard ==================
+void reconnect() {
+  if (!tbEnabled) return;  // nếu đã hủy thì không reconnect
+
+  while (!client.connected()) {
+    Serial.print("🌍 Kết nối ThingsBoard...");
+    if (client.connect("ESP32Client", tbToken, NULL)) {
+      Serial.println(" --> OK");
+    } else {
+      Serial.print(" --> FAIL, rc=");
+      Serial.print(client.state());
+      Serial.println(" thử lại sau 5s");
+      delay(5000);
+    }
+  }
+}
+
+// ================== Setup ==================
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(BOOT_PIN, INPUT_PULLUP); // Nút BOOT là active LOW
+
+  setup_wifi();
+  client.setServer(tbServer, tbPort);
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+
+  if (!pox.begin()) {
+    Serial.println("❌ Không tìm thấy MAX30100!");
+    for (;;);
+  }
+  Serial.println("✅ MAX30100 sẵn sàng!");
+
+  pox.setOnBeatDetectedCallback(onBeatDetected);
+  pox.setIRLedCurrent(MAX30100_LED_CURR_20_8MA);
+}
+
+// ================== Loop ==================
+void loop() {
+  // Kiểm tra nút BOOT
+  if (digitalRead(BOOT_PIN) == LOW && tbEnabled) {
+    Serial.println("🛑 Nút BOOT được nhấn → Ngắt kết nối ThingsBoard!");
+    client.disconnect();
+    tbEnabled = false;   // Không cho reconnect nữa
+    delay(1000);
+  }
+
+  // Nếu chưa bị ngắt thì giữ kết nối MQTT
+  if (tbEnabled) {
+    if (!client.connected()) {
+      reconnect();
+    }
+    client.loop();
+  }
+
+  // Luôn cập nhật MAX30100
+  pox.update();
+
+  // Mỗi 2s đọc dữ liệu
+  if (millis() - tsLastReport > 2000) {
+    float bpm = pox.getHeartRate();
+    float spo2 = pox.getSpO2();
+
+    Serial.print("💓 BPM: ");
+    Serial.print(bpm);
+    Serial.print(" | SpO2: ");
+    Serial.println(spo2);
+
+    // Nếu còn kết nối TB thì gửi dữ liệu
+    if (tbEnabled && bpm > 0 && spo2 > 0) {
+      String payload = "{";
+      payload += "\"bpm\":";
+      payload += bpm;
+      payload += ",\"spo2\":";
+      payload += spo2;
+      payload += "}";
+
+      client.publish("v1/devices/me/telemetry", payload.c_str());
+      Serial.println("📤 Đã gửi dữ liệu lên ThingsBoard!");
+    }
+
+    tsLastReport = millis();
+  }
+}
