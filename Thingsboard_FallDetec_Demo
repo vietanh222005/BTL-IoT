@@ -1,0 +1,185 @@
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <TinyGPS++.h>
+#include <HardwareSerial.h>
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+
+// ================= WIFI & THINGSBOARD =================
+const char* ssid = "Long";          
+const char* password = "nguyentienlong";
+const char* mqtt_server = "thingsboard.cloud";
+const int mqtt_port = 1883;
+const char* access_token = "a7fZCsLqePMKmZCSIHD6";
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+// ================= GPS CONFIG =================
+#define GPS_RX 16   
+#define GPS_TX 17   
+#define GPS_BAUD 9600
+TinyGPSPlus gps;
+HardwareSerial SerialGPS(2);
+
+// ================= MPU6050 CONFIG =================
+#define MPU_SDA 21
+#define MPU_SCL 22
+Adafruit_MPU6050 mpu;
+const float G = 9.80665;
+
+// ================= Kalman Filter =================
+float kalmanX = 0, kalmanY = 0, kalmanZ = 0;
+float P_kx = 1, P_ky = 1, P_kz = 1;
+float Q = 0.05;  // Nhiễu quá trình
+float R = 0.5;   // Nhiễu đo
+
+float kalmanUpdate(float measurement, float &estimate, float &P_k) {
+  P_k += Q;
+  float K = P_k / (P_k + R);
+  estimate = estimate + K * (measurement - estimate);
+  P_k = (1 - K) * P_k;
+  return estimate;
+}
+
+// ================= NGƯỠNG NGÃ =================
+const float FREEFALL_THRESH_G = 0.9; 
+const float IMPACT_THRESH_G   = 1.5; 
+
+bool impactDetected = false;
+bool systemReady = false;
+
+// ================== KHAI BÁO HÀM ==================
+void reconnectMQTT();
+
+// ================== SETUP ==================
+void setup() {
+  Serial.begin(115200);
+  Serial.println("🚀 ESP32 + GPS + MPU6050 + Kalman Filter + ThingsBoard");
+
+  // --- WiFi ---
+  WiFi.begin(ssid, password);
+  Serial.print("🔗 Kết nối WiFi...");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\n✅ WiFi đã kết nối!");
+  Serial.print("Địa chỉ IP: ");
+  Serial.println(WiFi.localIP());
+
+  // --- MQTT ---
+  client.setServer(mqtt_server, mqtt_port);
+
+  // --- GPS ---
+  SerialGPS.begin(GPS_BAUD, SERIAL_8N1, GPS_RX, GPS_TX);
+  Serial.println("📡 Đang khởi tạo GPS...");
+
+  // --- MPU6050 ---
+  Wire.begin(MPU_SDA, MPU_SCL);
+  if (!mpu.begin()) {
+    Serial.println("❌ Không tìm thấy MPU6050, kiểm tra dây nối!");
+    while (1) delay(10);
+  }
+  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+  Serial.println("✅ MPU6050 đã sẵn sàng.");
+  Serial.println("==============================================");
+}
+
+// ================== LOOP ==================
+void loop() {
+  if (!client.connected()) reconnectMQTT();
+  client.loop();
+
+  while (SerialGPS.available() > 0) gps.encode(SerialGPS.read());
+
+  // Chờ GPS có tín hiệu
+  if (!systemReady) {
+    if (gps.satellites.isValid() && gps.satellites.value() > 0) {
+      systemReady = true;
+      Serial.println("✅ GPS đã bắt được vệ tinh!");
+      Serial.println("🚀 Hệ thống bắt đầu đo với Kalman Filter...");
+      delay(1000);
+    } else {
+      Serial.println("⏳ Đang chờ GPS bắt vệ tinh...");
+      delay(1000);
+      return;
+    }
+  }
+
+  // --- Đọc dữ liệu từ MPU6050 ---
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+
+  // --- Lọc Kalman ---
+  float ax_f = kalmanUpdate(a.acceleration.x, kalmanX, P_kx);
+  float ay_f = kalmanUpdate(a.acceleration.y, kalmanY, P_ky);
+  float az_f = kalmanUpdate(a.acceleration.z, kalmanZ, P_kz);
+  float total_filt = sqrt(ax_f * ax_f + ay_f * ay_f + az_f * az_f);
+
+  // --- Phát hiện ngã ---
+  impactDetected = false;
+  String fallStatus = "Normal";
+  if (total_filt < FREEFALL_THRESH_G * G) {
+    Serial.println("⚠️ Rơi tự do phát hiện!");
+    impactDetected = true;
+    fallStatus = "Freefall";
+  } else if (total_filt > IMPACT_THRESH_G * G) {
+    Serial.println("💥 Va chạm mạnh phát hiện!");
+    impactDetected = true;
+    fallStatus = "Impact";
+  }
+
+  // --- In dữ liệu ---
+  Serial.println("----- DỮ LIỆU ĐÃ LỌC (KALMAN) -----");
+  Serial.print("ax_filt: "); Serial.print(ax_f, 2); Serial.println(" m/s²");
+  Serial.print("ay_filt: "); Serial.print(ay_f, 2); Serial.println(" m/s²");
+  Serial.print("az_filt: "); Serial.print(az_f, 2); Serial.println(" m/s²");
+  Serial.print("→ Tổng vector (Total): "); Serial.print(total_filt, 2); Serial.println(" m/s²");
+
+  double lat = 0.0, lng = 0.0;
+  if (gps.location.isValid()) {
+    lat = gps.location.lat();
+    lng = gps.location.lng();
+    Serial.print("🌍 Vị trí: ");
+    Serial.print(lat, 6); Serial.print(", "); Serial.println(lng, 6);
+  } else {
+    Serial.println("⚠️ GPS chưa có tọa độ!");
+  }
+
+  Serial.println("==============================================\n");
+
+  // --- Gửi dữ liệu lên ThingsBoard ---
+  String payload = "{";
+  payload += "\"ax_filt\":" + String(ax_f, 2) + ",";
+  payload += "\"ay_filt\":" + String(ay_f, 2) + ",";
+  payload += "\"az_filt\":" + String(az_f, 2) + ",";
+  payload += "\"total_filt\":" + String(total_filt, 2) + ",";
+  payload += "\"fall_status\":\"" + fallStatus + "\",";
+  payload += "\"latitude\":" + String(lat, 6) + ",";
+  payload += "\"longitude\":" + String(lng, 6);
+  payload += "}";
+
+  client.publish("v1/devices/me/telemetry", payload.c_str());
+  Serial.println("📤 Dữ liệu đã gửi lên ThingsBoard!");
+  Serial.println(payload);
+  Serial.println("==============================================\n");
+
+  delay(1000);
+}
+
+// ================== MQTT KẾT NỐI ==================
+void reconnectMQTT() {
+  while (!client.connected()) {
+    Serial.print("🔁 Kết nối ThingsBoard...");
+    if (client.connect("ESP32_Device", access_token, NULL)) {
+      Serial.println("✅ MQTT đã kết nối!");
+    } else {
+      Serial.print("❌ Thất bại, mã lỗi=");
+      Serial.println(client.state());
+      delay(2000);
+    }
+  }
+}
