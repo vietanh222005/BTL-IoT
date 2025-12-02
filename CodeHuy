@@ -1,0 +1,451 @@
+%% ============================
+% FULL EEG STRESS ANALYSIS - 1 NGƯỜI
+% - Đọc trực tiếp các trial Relax / Arithmetic (.mat)
+% - Tiền xử lý theo pipeline của bạn:
+%   + Band-pass 0.5–45 Hz
+%   + Notch 50 Hz
+%   + Savitzky-Golay detrend
+%   + ICA loại nhiễu (EEGLAB)
+%   + Wavelet artifact removal
+%   + Chuẩn hóa z-score từng kênh
+% - Không lưu EEG_avg.mat, dùng trực tiếp trong phân tích
+%% ============================
+
+clear; clc; close all;
+
+%% ======= DANH SÁCH FILE (SỬA ĐƯỜNG DẪN CHO ĐÚNG) =======
+relax_files = {
+    'C:\Users\ahnhw\OneDrive\Thư mục mới\raw_data\Relax_sub_31_trial1.mat';
+    'C:\Users\ahnhw\OneDrive\Thư mục mới\raw_data\Relax_sub_31_trial2.mat';
+    'C:\Users\ahnhw\OneDrive\Thư mục mới\raw_data\Relax_sub_31_trial3.mat'
+};
+
+arith_files = {
+    'C:\Users\ahnhw\OneDrive\Thư mục mới\raw_data\Arithmetic_sub_31_trial1.mat';
+    'C:\Users\ahnhw\OneDrive\Thư mục mới\raw_data\Arithmetic_sub_31_trial2.mat';
+    'C:\Users\ahnhw\OneDrive\Thư mục mới\raw_data\Arithmetic_sub_31_trial3.mat'
+};
+
+fs = 128;  % tần số mẫu
+
+%% ======= TIỀN XỬ LÝ & TRUNG BÌNH NHÓM TRIAL =======
+% Sử dụng pipeline preprocess_one() cho từng trial
+EEG_relax_pp = process_group(relax_files, fs);   % kênh x mẫu
+EEG_arith_pp = process_group(arith_files, fs);
+
+[nCh, nS] = size(EEG_relax_pp);
+t = (0:nS-1)/fs;
+
+%% ===== 1. RAW EEG AVERAGE (sau tiền xử lý) =====
+raw_relax = mean(EEG_relax_pp,1);
+raw_arith = mean(EEG_arith_pp,1);
+
+figure('Name','Raw EEG Average (preprocessed)');
+subplot(2,1,1);
+plot(t, raw_relax,'b','LineWidth',1.0); grid on;
+xlabel('Time (s)'); ylabel('Amplitude (\muV)');
+title('Raw EEG Average - Relax (preprocessed)');
+
+subplot(2,1,2);
+plot(t, raw_arith,'r','LineWidth',1.0); grid on;
+xlabel('Time (s)'); ylabel('Amplitude (\muV)');
+title('Raw EEG Average - Arithmetic (preprocessed)');
+
+%% ===== 2. PSD (Welch) overall (mean across channels) =====
+win_len = min(512, nS);
+noverlap = floor(win_len/2);
+nfft = 1024;
+
+[pxx_relax_all,f]  = pwelch(mean(EEG_relax_pp,1),  hamming(win_len), noverlap, nfft, fs);
+[pxx_arith_all,~]  = pwelch(mean(EEG_arith_pp,1), hamming(win_len), noverlap, nfft, fs);
+
+figure('Name','PSD - Relax vs Arithmetic (mean signal)');
+plot(f,10*log10(pxx_relax_all),'b','LineWidth',1.2); hold on;
+plot(f,10*log10(pxx_arith_all),'r','LineWidth',1.2);
+xlim([0 40]); grid on;
+xlabel('Frequency (Hz)'); ylabel('Power (dB)');
+title('PSD - Relax vs Arithmetic (mean across channels)');
+legend('Relax','Arithmetic');
+
+%% ===== 3. SUB-BAND FILTERS (delta, theta, alpha, beta) =====
+bands = [0.5 4; 4 8; 8 12; 13 30]; % delta theta alpha beta
+band_names = {'Delta','Theta','Alpha','Beta'};
+nBands = size(bands,1);
+
+relax_filt = zeros(nCh, nS, nBands);
+arith_filt = zeros(nCh, nS, nBands);
+
+for b = 1:nBands
+    [b_b,a_b] = butter(4, bands(b,:)/(fs/2));
+    for ch = 1:nCh
+        relax_filt(ch,:,b) = filtfilt(b_b,a_b,EEG_relax_pp(ch,:));
+        arith_filt(ch,:,b) = filtfilt(b_b,a_b,EEG_arith_pp(ch,:));
+    end
+end
+
+%% ===== 4. BANDPOWER ± STD (per channel, rồi mean±std) =====
+bp_relax = zeros(nCh,nBands);
+bp_arith = zeros(nCh,nBands);
+
+for b = 1:nBands
+    for ch = 1:nCh
+        bp_relax(ch,b) = bandpower(squeeze(relax_filt(ch,:,b)), fs, bands(b,:));
+        bp_arith(ch,b) = bandpower(squeeze(arith_filt(ch,:,b)), fs, bands(b,:));
+    end
+end
+
+mean_relax = mean(bp_relax,1); std_relax = std(bp_relax,0,1);
+mean_arith = mean(bp_arith,1); std_arith = std(bp_arith,0,1);
+
+figure('Name','Bandpower ± STD'); hold on;
+vals = [mean_relax; mean_arith]';
+b = bar(categorical(band_names), vals, 'grouped');
+b(1).FaceColor = [0.2 0.6 0.9];
+b(2).FaceColor = [0.9 0.4 0.4];
+
+ngroups = size(vals,1);
+nbars   = size(vals,2);
+groupwidth = min(0.8, nbars/(nbars+1.5));
+for i = 1:nbars
+    x = (1:ngroups) - groupwidth/2 + (2*i-1)*groupwidth/(2*nbars);
+    if i==1
+        errorbar(x, mean_relax, std_relax, 'k','LineStyle','none','LineWidth',1.2);
+    else
+        errorbar(x, mean_arith, std_arith, 'k','LineStyle','none','LineWidth',1.2);
+    end
+end
+ylabel('Power (\muV^2)'); grid on;
+title('Bandpower ± std'); legend('Relax','Arithmetic');
+
+%% ===== 5. RATIOs: BETA/ALPHA và THETA/BETA =====
+ratio_beta_alpha_relax = bp_relax(:,4) ./ bp_relax(:,3);
+ratio_beta_alpha_arith = bp_arith(:,4) ./ bp_arith(:,3);
+ratio_theta_beta_relax = bp_relax(:,2) ./ bp_relax(:,4);
+ratio_theta_beta_arith = bp_arith(:,2) ./ bp_arith(:,4);
+
+ratio_relax_mean  = mean(ratio_beta_alpha_relax);
+ratio_arith_mean  = mean(ratio_beta_alpha_arith);
+theta_beta_relax_mean  = mean(ratio_theta_beta_relax);
+theta_beta_arith_mean  = mean(ratio_theta_beta_arith);
+
+figure('Name','Ratios');
+subplot(1,2,1);
+bar(categorical({'Relax','Arithmetic'}), [ratio_relax_mean ratio_arith_mean]);
+title('Beta/Alpha Ratio (stress index)'); ylabel('Beta/Alpha'); grid on;
+
+subplot(1,2,2);
+bar(categorical({'Relax','Arithmetic'}), [theta_beta_relax_mean theta_beta_arith_mean]);
+title('Theta/Beta Ratio'); ylabel('Theta/Beta'); grid on;
+
+%% ===== 6. SHANNON SPECTRAL ENTROPY (0.5–40 Hz) =====
+fmin = 0.5; fmax = 40;
+entropy_relax = zeros(1,nCh);
+entropy_arith = zeros(1,nCh);
+nfft   = 1024;
+win_len = min(512, nS);
+noverlap = floor(win_len/2);
+
+for ch = 1:nCh
+    [P_r, f] = pwelch(EEG_relax_pp(ch,:), hamming(win_len), noverlap, nfft, fs);
+    idx = f>=fmin & f<=fmax;
+    P_seg = P_r(idx);
+    P_seg = P_seg / sum(P_seg);
+    entropy_relax(ch) = -sum(P_seg .* log2(P_seg + eps));
+
+    [P_a, ~] = pwelch(EEG_arith_pp(ch,:), hamming(win_len), noverlap, nfft, fs);
+    P_seg2 = P_a(idx);
+    P_seg2 = P_seg2 / sum(P_seg2);
+    entropy_arith(ch) = -sum(P_seg2 .* log2(P_seg2 + eps));
+end
+
+figure('Name','Shannon Spectral Entropy');
+bar(categorical({'Relax','Arithmetic'}), [mean(entropy_relax) mean(entropy_arith)]);
+ylabel('Entropy (bits)'); grid on;
+title('Shannon Spectral Entropy (0.5–40 Hz)');
+
+%% ===== 7. FILTERED WAVES (mean across channels) =====
+figure('Name','Filtered Waves (mean across channels)');
+for b = 1:nBands
+    subplot(nBands,2,2*b-1);
+    plot(t, mean(relax_filt(:,:,b),1),'b','LineWidth',1.0); grid on;
+    title(['Relax - ' band_names{b}]);
+    xlabel('Time (s)');
+
+    subplot(nBands,2,2*b);
+    plot(t, mean(arith_filt(:,:,b),1),'r','LineWidth',1.0); grid on;
+    title(['Arithmetic - ' band_names{b}]);
+    xlabel('Time (s)');
+end
+
+%% ===== 8. PSD per-channel example (channel 1) + peak detection =====
+figure('Name','PSD Channel 1 + peaks');
+[pxx_relax_ch1,f] = pwelch(EEG_relax_pp(1,:), hamming(win_len), noverlap, nfft, fs);
+[pxx_arith_ch1,~] = pwelch(EEG_arith_pp(1,:), hamming(win_len), noverlap, nfft, fs);
+
+subplot(2,1,1);
+plot(f, pxx_relax_ch1, 'b'); xlim([0 40]); grid on; title('Relax – PSD (ch1)');
+alpha_idx = find(f>=8  & f<=12);
+beta_idx  = find(f>=13 & f<=30);
+[~,aPeak] = max(pxx_relax_ch1(alpha_idx));
+[~,bPeak] = max(pxx_relax_ch1(beta_idx));
+hold on;
+plot(f(alpha_idx(aPeak)), pxx_relax_ch1(alpha_idx(aPeak)), 'ko', 'MarkerFaceColor','y');
+plot(f(beta_idx(bPeak)),  pxx_relax_ch1(beta_idx(bPeak)),  'ko', 'MarkerFaceColor','g');
+legend('PSD','Alpha peak','Beta peak');
+
+subplot(2,1,2);
+plot(f, pxx_arith_ch1, 'r'); xlim([0 40]); grid on; title('Arithmetic – PSD (ch1)');
+[~,aPeak2] = max(pxx_arith_ch1(alpha_idx));
+[~,bPeak2] = max(pxx_arith_ch1(beta_idx));
+hold on;
+plot(f(alpha_idx(aPeak2)), pxx_arith_ch1(alpha_idx(aPeak2)), 'ko', 'MarkerFaceColor','y');
+plot(f(beta_idx(bPeak2)),  pxx_arith_ch1(beta_idx(bPeak2)),  'ko', 'MarkerFaceColor','g');
+legend('PSD','Alpha peak','Beta peak');
+
+%% ===== 9. TOTAL BANDPOWER (0.5–40 Hz) =====
+total_band = [0.5 40];
+total_relax = zeros(1,nCh);
+total_arith = zeros(1,nCh);
+for ch = 1:nCh
+    total_relax(ch) = bandpower(EEG_relax_pp(ch,:), fs, total_band);
+    total_arith(ch) = bandpower(EEG_arith_pp(ch,:), fs, total_band);
+end
+
+mean_total_relax = mean(total_relax);
+mean_total_arith = mean(total_arith);
+std_total_relax  = std(total_relax);
+std_total_arith  = std(total_arith);
+
+figure('Name','Total Bandpower (0.5–40 Hz)');
+bar(categorical({'Relax','Arithmetic'}), [mean_total_relax mean_total_arith]);
+ylabel('Power (\muV^2)'); grid on;
+title('Total Bandpower (0.5–40 Hz)');
+
+%% ===== 10. STATISTICAL TESTS (paired) & EFFECT SIZE =====
+fprintf('\n===== STATISTICAL TESTS (paired) =====\n');
+for b = 1:nBands
+    x = bp_relax(:,b);
+    y = bp_arith(:,b);
+    valid = ~isnan(x) & ~isnan(y);
+    x = x(valid); y = y(valid);
+    if isempty(x)
+        fprintf('%s: no valid data\n', band_names{b});
+        continue;
+    end
+    try
+        [h_norm, ~] = lillietest(x - y);
+    catch
+        h_norm = 1; % nếu không có lillietest -> coi như non-normal
+    end
+    if h_norm == 0
+        [h,p] = ttest(x,y);
+        testname = 'paired t-test';
+    else
+        p = signrank(x,y);
+        h = p < 0.05;
+        testname = 'wilcoxon (signrank)';
+    end
+    d = (mean(x-y)) / std(x-y);
+    fprintf('%s: %s p=%.4f (h=%d), cohens_d=%.3f\n', band_names{b}, testname, p, h, d);
+end
+
+% Ratios: Beta/Alpha
+[x,y] = deal(ratio_beta_alpha_relax, ratio_beta_alpha_arith);
+valid = ~isnan(x) & ~isnan(y); x = x(valid); y = y(valid);
+if ~isempty(x)
+    [~,p] = ttest(x,y);
+    d = mean(x-y)/std(x-y);
+    fprintf('Beta/Alpha ratio: paired t-test p=%.4f, cohens_d=%.3f\n', p, d);
+end
+
+% Entropy
+[x,y] = deal(entropy_relax, entropy_arith);
+valid = ~isnan(x) & ~isnan(y); x = x(valid); y = y(valid);
+if ~isempty(x)
+    [~,p_e] = ttest(x,y);
+    d_e = mean(x-y)/std(x-y);
+    fprintf('Entropy: paired t-test p=%.4f, cohens_d=%.3f\n', p_e, d_e);
+end
+
+% Total bandpower
+[x,y] = deal(total_relax, total_arith);
+valid = ~isnan(x) & ~isnan(y); x = x(valid); y = y(valid);
+if ~isempty(x)
+    [~,p_t] = ttest(x,y);
+    d_t = mean(x-y)/std(x-y);
+    fprintf('Total bandpower: paired t-test p=%.4f, cohens_d=%.3f\n', p_t, d_t);
+end
+
+%% ===== 11. FEATURE-BASED CONCLUSION (rule-based) =====
+fprintf('\n===== FEATURE-BASED CONCLUSION =====\n');
+
+score_relax  = 0;
+score_arith  = 0;
+
+% Feature 1: Alpha Power (Relax expected higher)
+if mean_relax(3) > mean_arith(3)
+    score_relax = score_relax + 1;
+else
+    score_arith = score_arith + 1;
+end
+
+% Feature 2: Beta Power (Arithmetic expected higher)
+if mean_arith(4) > mean_relax(4)
+    score_arith = score_arith + 1;
+else
+    score_relax = score_relax + 1;
+end
+
+% Feature 3: Beta/Alpha Ratio (higher -> stress)
+if ratio_arith_mean > ratio_relax_mean
+    score_arith = score_arith + 1;
+else
+    score_relax = score_relax + 1;
+end
+
+% Feature 4: Shannon Entropy (Stress thường cao hơn)
+if mean(entropy_arith) > mean(entropy_relax)
+    score_arith = score_arith + 1;
+else
+    score_relax = score_relax + 1;
+end
+
+% Feature 5: Total Bandpower
+if mean_total_arith > mean_total_relax
+    score_arith = score_arith + 1;
+else
+    score_relax = score_relax + 1;
+end
+
+%% ===== 5b. THETA/BETA RATIO (phiên bản riêng) =====
+theta_relax = bp_relax(:,2);
+beta_relax  = bp_relax(:,4);
+theta_arith = bp_arith(:,2);
+beta_arith  = bp_arith(:,4);
+
+tbr_relax = mean(theta_relax ./ beta_relax);
+tbr_arith = mean(theta_arith ./ beta_arith);
+
+figure('Name','Theta/Beta Ratio');
+bar(categorical({'Relax','Arithmetic'}), [tbr_relax tbr_arith],0.5);
+ylabel('Theta/Beta Ratio'); grid on;
+title('Attention / Stress Index (Theta/Beta)');
+
+% Feature 6: Theta/Beta Ratio (ví dụ: lower TBR => higher stress)
+if tbr_arith < tbr_relax
+    score_arith = score_arith + 1;
+else
+    score_relax = score_relax + 1;
+end
+
+fprintf('Relax Score     : %d\n', score_relax);
+fprintf('Arithmetic Score: %d\n', score_arith);
+
+if score_arith > score_relax
+    fprintf('\n>>> FINAL CONCLUSION: Arithmetic condition shows higher stress markers (rule-based).\n');
+else
+    fprintf('\n>>> FINAL CONCLUSION: Relax condition is calmer with lower stress markers (rule-based).\n');
+end
+
+disp('=== DONE ===');
+
+%% ============================
+% ===== LOCAL FUNCTIONS =======
+%% ============================
+
+function avg = process_group(files, fs)
+    n = length(files);
+    for i = 1:n
+        tmp = preprocess_one(files{i}, fs);
+        if i==1
+            all_data = zeros([size(tmp), n]); % kênh x mẫu x trial
+        end
+        all_data(:,:,i) = tmp;
+    end
+    avg = mean(all_data,3);  % trung bình theo trial
+end
+
+function x = preprocess_one(path, fs)
+    % 1) Load data
+    x = load_data_auto(path);       % kênh x mẫu
+
+    % 2) Notch 50 Hz
+    wo = 50/(fs/2);
+    bw = wo/35;
+    [bn,an] = iirnotch(wo,bw);
+    x = filtfilt(bn,an,x')';
+
+    % 3) Band-pass 0.5–45 Hz
+    [b,a] = butter(4, [0.5 45]/(fs/2), 'bandpass');
+    x = filtfilt(b,a,x')';
+
+    % 4) Remove drift bằng Savitzky-Golay
+    x = remove_drift_sgolay(x, fs);
+
+    % 5) ICA loại nhiễu (dùng EEGLAB)
+    x = apply_ica(x, fs);
+
+    % 6) Wavelet artifact removal
+    x = wavelet_artifact_remove(x);
+
+    % 7) Chuẩn hóa z-score theo từng kênh
+    x = zscore(x,0,2);
+end
+
+function X = load_data_auto(path)
+    S  = load(path);
+    fn = fieldnames(S);
+    X  = S.(fn{1});   % giả sử file có 1 biến chính
+end
+
+function x = remove_drift_sgolay(x, fs)
+    [r, c] = size(x);
+    out = zeros(size(x));
+    % cửa sổ SG ~1s (tuỳ chỉnh)
+    sg_win = round(1*fs);
+    if mod(sg_win,2)==0, sg_win = sg_win+1; end
+    sg_order = 3;
+
+    for ii = 1:r
+        trend = sgolayfilt(x(ii,:), sg_order, sg_win);
+        out(ii,:) = x(ii,:) - trend;
+    end
+    x = out;
+end
+
+function x = apply_ica(x, fs)
+    % x: channels x samples
+    % cần EEGLAB trong path
+    EEG = pop_importdata('data', x', 'srate', fs); % transpose -> samples x channels
+    EEG = eeg_checkset(EEG);
+
+    EEG = pop_runica(EEG, 'extended',1,'interrupt','off');
+
+    % Tự động chọn IC nhiễu mắt dựa trên frontal variance (simple)
+    icToRemove = detect_eog_components(EEG);
+    if ~isempty(icToRemove)
+        EEG = pop_subcomp(EEG, icToRemove, 0);
+        EEG = eeg_checkset(EEG);
+    end
+
+    x = EEG.data';   % channels x samples
+end
+
+function comps = detect_eog_components(EEG)
+    % Simple heuristic: IC có phương sai lớn trên 2 kênh frontal đầu tiên
+    nFront = min(2, size(EEG.icawinv,1));
+    varComp = var(EEG.icawinv(1:nFront,:));
+    comps = find(varComp > 0.5*max(varComp));
+end
+
+function x = wavelet_artifact_remove(x)
+    [r, ~] = size(x);
+    clean = zeros(size(x));
+    for jj = 1:r
+        [C,L] = wavedec(x(jj,:),4,'db2');
+        t = 0.8*std(detcoef(C,L,3));
+        C_thresh = wthresh(C,'s',t);
+        clean(jj,:) = waverec(C_thresh,L,'db2');
+    end
+    x = clean;
+end
